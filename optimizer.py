@@ -28,15 +28,18 @@ def _parse_week(week):
     """
     Robustly parse the week argument into a 1-indexed integer or None.
 
-    Accepted forms:
-        None              -> None  (use all days)
+    Returns None for:
+        None, "", "null", "none", "string", "undefined", "nan",
+        or any other non-numeric placeholder sent by Lovable/UI.
+
+    Returns int for valid inputs:
         8  (int)          -> 8
         "8"               -> 8
         "W08" / "W8"      -> 8
         "2026-W08"        -> 8
         "2026W08"         -> 8
 
-    Raises ValueError if a non-None value cannot be resolved to a positive integer.
+    Raises ValueError only for explicitly out-of-range numeric values (e.g. 0).
     """
     if week is None:
         return None
@@ -47,6 +50,11 @@ def _parse_week(week):
         return week
 
     raw = str(week).strip()
+
+    # Treat empty strings and known UI/placeholder sentinels as "no week selected"
+    _SENTINELS = {"", "null", "none", "string", "undefined", "nan"}
+    if raw.lower() in _SENTINELS:
+        return None
 
     # Extract digits after a 'W' (case-insensitive): "2026-W08" -> 8
     m = re.search(r"[Ww](\d{1,2})", raw)
@@ -61,10 +69,8 @@ def _parse_week(week):
             raise ValueError(f"week must be >= 1, got {val!r} from input {week!r}")
         return val
 
-    raise ValueError(
-        f"Cannot parse week number from {week!r}. "
-        f"Expected an int or a string like 8, 'W08', or '2026-W08'."
-    )
+    # Anything else (pure letters, unknown symbols) — treat as no week selected
+    return None
 
 
 # ── Data loading ───────────────────────────────────────────────────────────────
