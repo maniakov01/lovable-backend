@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, Union
@@ -18,25 +18,28 @@ def health():
     return {"ok": True}
 
 class RunRequest(BaseModel):
-    # ✅ accept both 1 and "W01" and "2026-W08"
+    # Accept either 1 or "1" or "W01" or "2026-W01"
     week: Optional[Union[int, str]] = None
-    scenario: Optional[str] = None
+    scenario: Optional[str] = "base"
 
 @app.post("/run")
 def run(req: RunRequest):
     from optimizer import run_optimization
 
-    # Normalize week into something optimizer can parse
-    week_value = None
-    if req.week is not None:
-        week_value = str(req.week).strip()   # "1" or "W01" or "2026-W08"
+    # IMPORTANT: If Lovable sends nothing, default to week 1
+    week_value = req.week
+    if week_value is None:
+        week_value = 1
 
-    results = run_optimization(
-        week=week_value,
-        scenario=req.scenario
-    )
+    # Pass week as string OR int — optimizer can decide, but we normalize to string safely
+    # (If your optimizer expects int, change this to: week_value = int(week_value))
+    week_value = str(week_value)
 
-    return {
-        "status": "done",
-        "results": results
-    }
+    try:
+        results = run_optimization(week=week_value, scenario=req.scenario)
+        return {"status": "done", "results": results}
+    except ValueError as e:
+        # Your optimizer raises ValueError for out-of-range weeks, etc.
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Server error: {e}")
