@@ -8,7 +8,7 @@ Outputs: JSON-serializable dict  {kpis, tables}
 """
 
 import os
-import math
+import re
 from collections import defaultdict
 from itertools import combinations
 
@@ -20,6 +20,51 @@ import pulp
 AVG_FULL_LOAD_LBS = 26 * 1445   # 26 pallets × ~1,445 lbs — full-truck baseline
 UNSERVED_PENALTY  = 100_000     # $ penalty per unserved job
 DATA_FILENAME     = "fleet_scheduling_data_v2.xlsx"
+
+
+# ── Week parser ────────────────────────────────────────────────────────────────
+
+def _parse_week(week):
+    """
+    Robustly parse the week argument into a 1-indexed integer or None.
+
+    Accepted forms:
+        None              -> None  (use all days)
+        8  (int)          -> 8
+        "8"               -> 8
+        "W08" / "W8"      -> 8
+        "2026-W08"        -> 8
+        "2026W08"         -> 8
+
+    Raises ValueError if a non-None value cannot be resolved to a positive integer.
+    """
+    if week is None:
+        return None
+
+    if isinstance(week, int):
+        if week < 1:
+            raise ValueError(f"week must be >= 1, got {week}")
+        return week
+
+    raw = str(week).strip()
+
+    # Extract digits after a 'W' (case-insensitive): "2026-W08" -> 8
+    m = re.search(r"[Ww](\d{1,2})", raw)
+    if m:
+        return int(m.group(1))
+
+    # Fall back to any digit sequence: "8", "08"
+    m = re.search(r"\d+", raw)
+    if m:
+        val = int(m.group())
+        if val < 1:
+            raise ValueError(f"week must be >= 1, got {val!r} from input {week!r}")
+        return val
+
+    raise ValueError(
+        f"Cannot parse week number from {week!r}. "
+        f"Expected an int or a string like 8, 'W08', or '2026-W08'."
+    )
 
 
 # ── Data loading ───────────────────────────────────────────────────────────────
@@ -50,15 +95,16 @@ def _locate_data_file():
     )
 
 
-def _load_data(week, scenario):
+def _load_data(week_int, scenario):
     """
     Load and filter Excel data.
 
     Parameters
     ----------
-    week     : int or None  — 1-indexed week number (1 = days 1-7, 2 = days 8-14, …)
-                              None → use all days in the file
-    scenario : str or None  — reserved for future scenario variants; currently unused
+    week_int : int or None — already-parsed 1-indexed week number
+                             (1 = rows 0-6, 2 = rows 7-13, ...)
+                             None -> use all days in the file
+    scenario : str or None — reserved for future scenario variants; currently unused
     """
     path = _locate_data_file()
 
@@ -68,11 +114,15 @@ def _load_data(week, scenario):
 
     # Days — filter to requested week
     df_days_all = pd.read_excel(path, sheet_name="Days")
-    if week is not None:
-        week = int(week)
-        start_row = (week - 1) * 7
+    if week_int is not None:
+        start_row = (week_int - 1) * 7
         end_row   = start_row + 7
         df_days   = df_days_all.iloc[start_row:end_row].copy()
+        if df_days.empty:
+            raise ValueError(
+                f"Week {week_int} is out of range — the dataset only has "
+                f"{len(df_days_all)} days ({len(df_days_all) // 7} full weeks)."
+            )
     else:
         df_days = df_days_all.copy()
 
@@ -108,7 +158,10 @@ def run_optimization(week=None, scenario=None):
 
     Parameters
     ----------
-    week     : int or None   1 = first 7 days, 2 = second 7 days, etc. None = full dataset
+    week     : int, str, or None
+                 Accepts: None, 8, "8", "W08", "2026-W08"
+                 1-indexed: week=1 -> first 7 days, week=2 -> next 7 days, etc.
+                 None -> run on all days in the dataset
     scenario : str or None   reserved for future use
 
     Returns
@@ -116,22 +169,23 @@ def run_optimization(week=None, scenario=None):
     dict with keys:
         "kpis"   : {total_cost, trips_scheduled, unserved_jobs, trucks_used,
                     fleet_utilization_pct, total_pallets, total_weight_lb,
-                    avg_pallets_per_trip, savings_pct, solver_status}
+                    avg_pallets_per_trip, savings_pct, solver_status, week, scenario}
         "tables" : {schedule: [...], cost_breakdown: [...]}
     """
 
-    # ── 1. Load data ──────────────────────────────────────────────────────────
-    df_plants, df_days, df_jobs, params = _load_data(week, scenario)
+    # ── 1. Parse and load data ────────────────────────────────────────────────
+    week_int = _parse_week(week)
+    df_plants, df_days, df_jobs, params = _load_data(week_int, scenario)
 
     plants      = df_plants["plant_id"].tolist()
     travel_time = dict(zip(df_plants["plant_id"], df_plants["travel_time_min"]))
     load_time   = dict(zip(df_plants["plant_id"], df_plants["load_time_min"]))
 
-    days       = df_days["day_id"].tolist()
-    is_weekend = dict(zip(df_days["day_id"], df_days["is_weekend"]))
+    days        = df_days["day_id"].tolist()
+    is_weekend  = dict(zip(df_days["day_id"], df_days["is_weekend"]))
     day_to_date = dict(zip(df_days["day_id"], pd.to_datetime(df_days["date"])))
 
-    # Build job tuples
+    # Build job tuples (plant, day, seq)
     all_jobs      = []
     job_id_lookup = {}
     job_window    = {}
@@ -179,9 +233,10 @@ def run_optimization(week=None, scenario=None):
         for p in plants
     }
 
+    # Keyed by explicit tuple (plant, day, seq) — always accessed as [(p, d, s)]
     trip_cost_per_job = {
-        jt: trip_cost_base[jt[0]] * job_weight[jt] / AVG_FULL_LOAD_LBS
-        for jt in all_jobs
+        (p, d, s): trip_cost_base[p] * job_weight[(p, d, s)] / AVG_FULL_LOAD_LBS
+        for (p, d, s) in all_jobs
     }
 
     max_trips_per_day = max(
@@ -216,7 +271,7 @@ def run_optimization(week=None, scenario=None):
         for (p, d, s) in all_jobs
     }
 
-    # s_var[truck, plant, day, seq] — continuous start time (minutes)
+    # s_var[truck, plant, day, seq] — continuous start time (minutes from midnight)
     s_var = {
         (truck, p, d, s): pulp.LpVariable(
             f"s_{truck}_{p}_{d}_{s}",
@@ -227,7 +282,7 @@ def run_optimization(week=None, scenario=None):
         for (p, d, s) in all_jobs
     }
 
-    # z[truck, p1, d1, s1, p2, d2, s2] — ordering binary
+    # z[truck, p1, d1, s1, p2, d2, s2] — ordering binary (1 = job1 before job2)
     z = {
         (truck, p1, d1, s1, p2, d2, s2): pulp.LpVariable(
             f"z_{truck}_{p1}_{d1}_{s1}_{p2}_{d2}_{s2}", cat="Binary"
@@ -241,7 +296,7 @@ def run_optimization(week=None, scenario=None):
         for (p, d, s) in all_jobs
     }
 
-    # W[truck, day] — weekend activation
+    # W[truck, day] — weekend activation flag
     W = {
         (truck, day): pulp.LpVariable(f"W_{truck}_{day}", cat="Binary")
         for truck in trucks
@@ -251,7 +306,7 @@ def run_optimization(week=None, scenario=None):
     # ── Objective ─────────────────────────────────────────────────────────────
     model += (
         pulp.lpSum(
-            trip_cost_per_job[p, d, s] * x[truck, p, d, s]
+            trip_cost_per_job[(p, d, s)] * x[truck, p, d, s]
             for truck in trucks
             for (p, d, s) in all_jobs
         )
@@ -266,7 +321,7 @@ def run_optimization(week=None, scenario=None):
         )
     )
 
-    # ── Constraint 1: Every job served by exactly one truck or unserved ───────
+    # ── Constraint 1: Every job served by exactly one truck, or unserved ──────
     for (p, d, s) in all_jobs:
         model += (
             pulp.lpSum(x[truck, p, d, s] for truck in trucks) + u[p, d, s] == 1,
@@ -293,14 +348,17 @@ def run_optimization(week=None, scenario=None):
             )
 
     # ── Constraint 3: No-overlap — Big-M sequencing ───────────────────────────
+    # For each truck, each pair of jobs on the same day must not overlap.
+    # z=1 means job1 finishes before job2 starts; z=0 means the reverse.
+    # BIG_M terms deactivate the constraint when either job is unassigned.
     for (truck, p1, d1, s1, p2, d2, s2) in seq_pairs:
-        zv   = z[truck, p1, d1, s1, p2, d2, s2]
-        x1   = x[truck, p1, d1, s1]
-        x2   = x[truck, p2, d2, s2]
-        sv1  = s_var[truck, p1, d1, s1]
-        sv2  = s_var[truck, p2, d2, s2]
+        zv  = z[truck, p1, d1, s1, p2, d2, s2]
+        x1  = x[truck, p1, d1, s1]
+        x2  = x[truck, p2, d2, s2]
+        sv1 = s_var[truck, p1, d1, s1]
+        sv2 = s_var[truck, p2, d2, s2]
 
-        # If z=1 (job1 before job2): sv2 >= sv1 + dur1
+        # z=1: job1 before job2
         model += (
             sv2 >= sv1 + duration[p1]
             - BIG_M * (1 - zv)
@@ -309,7 +367,7 @@ def run_optimization(week=None, scenario=None):
             f"C3a_{truck}_{p1}_{d1}_{s1}_{p2}_{d2}_{s2}"
         )
 
-        # If z=0 (job2 before job1): sv1 >= sv2 + dur2
+        # z=0: job2 before job1
         model += (
             sv1 >= sv2 + duration[p2]
             - BIG_M * zv
@@ -333,10 +391,10 @@ def run_optimization(week=None, scenario=None):
     solver = pulp.PULP_CBC_CMD(
         msg=False,
         gapRel=0.01,    # stop within 1% of optimal
-        timeLimit=300,  # 5-minute cap
+        timeLimit=300,  # 5-minute hard cap
         threads=4,
     )
-    result = model.solve(solver)
+    model.solve(solver)
 
     solver_status = pulp.LpStatus[model.status]
 
@@ -345,13 +403,12 @@ def run_optimization(week=None, scenario=None):
 
     for truck in trucks:
         for (plant, day, seq) in all_jobs:
-            if pulp.value(x[truck, plant, day, seq]) is not None and \
-               pulp.value(x[truck, plant, day, seq]) > 0.5:
-
+            val = pulp.value(x[truck, plant, day, seq])
+            if val is not None and val > 0.5:
                 jt        = (plant, day, seq)
                 start_min = pulp.value(s_var[truck, plant, day, seq])
                 if start_min is None:
-                    start_min = WD_START if not is_weekend[day] else WE_START
+                    start_min = WE_START if is_weekend[day] else WD_START
 
                 finish_min = start_min + duration[plant]
 
@@ -368,11 +425,10 @@ def run_optimization(week=None, scenario=None):
                     "finish_time_min": int(round(finish_min)),
                     "finish_time"    : _minutes_to_hhmm(finish_min),
                     "duration_min"   : int(duration[plant]),
-                    "trip_cost_usd"  : round(float(trip_cost_per_job[jt]), 2),
+                    "trip_cost_usd"  : round(float(trip_cost_per_job[(plant, day, seq)]), 2),
                     "is_weekend"     : bool(is_weekend[day]),
                 })
 
-    # Sort by day, truck, start time
     schedule_rows.sort(key=lambda r: (r["day_id"], r["truck_id"], r["start_time_min"]))
 
     # KPI calculations
@@ -392,7 +448,7 @@ def run_optimization(week=None, scenario=None):
     total_weight  = sum(r["weight_lb"] for r in schedule_rows)
     obj_val       = float(pulp.value(model.objective)) if pulp.value(model.objective) is not None else 0.0
 
-    # Trip cost broken down by plant
+    # Trip cost broken down by plant (summed from schedule rows)
     trip_cost_by_plant = {}
     for plant in plants:
         trip_cost_by_plant[plant] = sum(
@@ -401,27 +457,26 @@ def run_optimization(week=None, scenario=None):
             if r["plant_id"] == plant
         )
 
-    total_trip_cost  = sum(trip_cost_by_plant.values())
-    weekend_cost     = sum(
-        WEEKEND_PENALTY * (pulp.value(W[t, d]) or 0)
+    total_trip_cost = sum(trip_cost_by_plant.values())
+    weekend_cost    = sum(
+        WEEKEND_PENALTY * (pulp.value(W[t, d]) or 0.0)
         for t in trucks for d in weekend_days
     )
-    unserved_cost    = unserved_count * UNSERVED_PENALTY
+    unserved_cost   = unserved_count * UNSERVED_PENALTY
 
-    # savings_pct: reduction vs naive baseline (every job done solo, no batching)
-    # Baseline = all jobs served at full-truck cost, no sequencing optimisation
+    # savings_pct: optimised trip cost vs naive baseline (one full-rate trip per job)
     baseline_cost = sum(trip_cost_base[p] for (p, d, s) in all_jobs)
-    savings_pct   = round((1 - total_trip_cost / baseline_cost) * 100, 2) if baseline_cost > 0 else 0.0
+    savings_pct   = round((1.0 - total_trip_cost / baseline_cost) * 100, 2) if baseline_cost > 0 else 0.0
 
     # Cost breakdown table
     cost_rows = [
-        {"category": "Trip Cost",          "plant": "Montreal_1", "amount_usd": round(trip_cost_by_plant.get("Montreal_1", 0.0), 2)},
-        {"category": "Trip Cost",          "plant": "Montreal_2", "amount_usd": round(trip_cost_by_plant.get("Montreal_2", 0.0), 2)},
-        {"category": "Trip Cost",          "plant": "Laval",      "amount_usd": round(trip_cost_by_plant.get("Laval",       0.0), 2)},
-        {"category": "Trip Cost",          "plant": "Terrebonne", "amount_usd": round(trip_cost_by_plant.get("Terrebonne",  0.0), 2)},
-        {"category": "Weekend Penalty",    "plant": "All",        "amount_usd": round(weekend_cost,   2)},
-        {"category": "Unserved Penalty",   "plant": "All",        "amount_usd": round(unserved_cost,  2)},
-        {"category": "Total",              "plant": "All",        "amount_usd": round(obj_val,        2)},
+        {"category": "Trip Cost",        "plant": "Montreal_1", "amount_usd": round(trip_cost_by_plant.get("Montreal_1", 0.0), 2)},
+        {"category": "Trip Cost",        "plant": "Montreal_2", "amount_usd": round(trip_cost_by_plant.get("Montreal_2", 0.0), 2)},
+        {"category": "Trip Cost",        "plant": "Laval",      "amount_usd": round(trip_cost_by_plant.get("Laval",       0.0), 2)},
+        {"category": "Trip Cost",        "plant": "Terrebonne", "amount_usd": round(trip_cost_by_plant.get("Terrebonne",  0.0), 2)},
+        {"category": "Weekend Penalty",  "plant": "All",        "amount_usd": round(weekend_cost,  2)},
+        {"category": "Unserved Penalty", "plant": "All",        "amount_usd": round(unserved_cost, 2)},
+        {"category": "Total",            "plant": "All",        "amount_usd": round(obj_val,       2)},
     ]
 
     # ── 6. Return structured result ───────────────────────────────────────────
@@ -440,11 +495,11 @@ def run_optimization(week=None, scenario=None):
             "avg_pallets_per_trip"  : round(total_pallets / trips_total, 1) if trips_total > 0 else 0.0,
             "weekend_truck_days"    : int(weekend_activations),
             "solver_status"         : solver_status,
-            "week"                  : int(week) if week is not None else None,
+            "week"                  : int(week_int) if week_int is not None else None,
             "scenario"              : str(scenario) if scenario is not None else None,
         },
         "tables": {
-            "schedule"        : schedule_rows,
-            "cost_breakdown"  : cost_rows,
+            "schedule"       : schedule_rows,
+            "cost_breakdown" : cost_rows,
         },
     }
