@@ -1,8 +1,7 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional
-import traceback
+from typing import Optional, Union
 
 app = FastAPI()
 
@@ -14,20 +13,34 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ---------
+# 1) Health
+# ---------
 @app.get("/health")
 def health():
     return {"ok": True}
 
+# -----------------------------
+# 2) Request model for /run
+#    week can be int OR string OR null
+# -----------------------------
 class RunRequest(BaseModel):
-    week: Optional[str] = None
+    week: Optional[Union[int, str]] = None
     scenario: Optional[str] = None
 
+# -----------------------------
+# 3) Run endpoint
+# -----------------------------
 @app.post("/run")
 def run(req: RunRequest):
-    try:
-        from optimizer import run_optimization
-        results = run_optimization(week=req.week, scenario=req.scenario)
-        return {"status": "done", "results": results}
-    except Exception as e:
-        print(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=str(e))
+    from optimizer import run_optimization
+
+    results = run_optimization(
+        week=req.week,
+        scenario=req.scenario
+    )
+
+    return {
+        "status": "done",
+        "results": results
+    }
