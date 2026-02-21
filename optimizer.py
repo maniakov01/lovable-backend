@@ -7,6 +7,7 @@ Inputs : fleet_scheduling_data_v2.xlsx  (co-located or via DATA_PATH env var)
 Outputs: JSON-serializable dict  {kpis, tables}
 """
 
+import math
 import os
 import re
 from collections import defaultdict
@@ -39,14 +40,14 @@ def _parse_week(week):
         "2026-W08"        -> 8
         "2026W08"         -> 8
 
-    Raises ValueError only for explicitly out-of-range numeric values (e.g. 0).
+    Never raises ValueError. Out-of-range or unrecognisable values return None.
     """
     if week is None:
         return None
 
     if isinstance(week, int):
         if week < 1:
-            raise ValueError(f"week must be >= 1, got {week}")
+            return None   # out-of-range int — fall back to full dataset
         return week
 
     raw = str(week).strip()
@@ -66,7 +67,7 @@ def _parse_week(week):
     if m:
         val = int(m.group())
         if val < 1:
-            raise ValueError(f"week must be >= 1, got {val!r} from input {week!r}")
+            return None   # out-of-range — fall back to full dataset
         return val
 
     # Anything else (pure letters, unknown symbols) — treat as no week selected
@@ -124,11 +125,10 @@ def _load_data(week_int, scenario):
         start_row = (week_int - 1) * 7
         end_row   = start_row + 7
         df_days   = df_days_all.iloc[start_row:end_row].copy()
-        if df_days.empty:
-            raise ValueError(
-                f"Week {week_int} is out of range — the dataset only has "
-                f"{len(df_days_all)} days ({len(df_days_all) // 7} full weeks)."
-            )
+        max_weeks = math.ceil(len(df_days_all) / 7)
+        if week_int < 1 or week_int > max_weeks or df_days.empty:
+            # Out-of-range week — silently fall back to the full dataset
+            df_days = df_days_all.copy()
     else:
         df_days = df_days_all.copy()
 
