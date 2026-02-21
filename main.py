@@ -13,30 +13,26 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------
-# 1) Health
-# ---------
 @app.get("/health")
 def health():
     return {"ok": True}
 
-# -----------------------------
-# 2) Request model for /run
-#    week can be int OR string OR null
-# -----------------------------
 class RunRequest(BaseModel):
+    # ✅ accept both 1 and "W01" and "2026-W08"
     week: Optional[Union[int, str]] = None
     scenario: Optional[str] = None
 
-# -----------------------------
-# 3) Run endpoint
-# -----------------------------
 @app.post("/run")
 def run(req: RunRequest):
     from optimizer import run_optimization
 
+    # Normalize week into something optimizer can parse
+    week_value = None
+    if req.week is not None:
+        week_value = str(req.week).strip()   # "1" or "W01" or "2026-W08"
+
     results = run_optimization(
-        week=req.week,
+        week=week_value,
         scenario=req.scenario
     )
 
